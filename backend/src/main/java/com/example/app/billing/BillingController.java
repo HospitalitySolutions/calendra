@@ -1516,7 +1516,7 @@ public class BillingController {
         }
         bill.setConsultant(open.getConsultant());
         bill.setPaymentMethod(open.getPaymentMethod() != null ? open.getPaymentMethod() : resolveDefaultPaymentMethod(companyId));
-        bill.setBankTransferReference(open.getReference());
+        applyCanonicalBankTransferReference(bill);
         bill.setIssueDate(LocalDate.now());
         if (open.getItems() == null || open.getItems().isEmpty()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Open bill has no items.");
@@ -1573,7 +1573,8 @@ public class BillingController {
 
     /**
      * Builds an in-memory Bill from an open-bill editor payload for PDF preview only.
-     * No invoice number is reserved, no fiscalization runs, no S3 object is archived, and no DB row is saved.
+     * The current invoice counter value is shown without reserving/incrementing it.
+     * No fiscalization runs, no S3 object is archived, and no DB row is saved.
      */
     private Bill buildTransientOpenBillPreview(OpenBill open, OpenBillUpdateRequest req, Long companyId, User me) {
         if (open == null) {
@@ -1581,7 +1582,7 @@ public class BillingController {
         }
         var bill = new Bill();
         bill.setCompany(me.getCompany());
-        bill.setBillNumber("PREVIEW-OPEN-" + open.getId());
+        bill.setBillNumber(peekInvoiceNumber(companyId));
         bill.setBillType(open.getBillType() != null ? open.getBillType() : BillType.INVOICE);
 
         Client client = resolvePreviewClient(open, req, companyId);
@@ -1607,7 +1608,7 @@ public class BillingController {
         bill.setConsultant(consultant);
         PaymentMethod paymentMethod = resolvePreviewPaymentMethod(open, req, companyId);
         bill.setPaymentMethod(paymentMethod);
-        bill.setBankTransferReference(req != null && req.reference() != null ? req.reference().trim() : open.getReference());
+        applyCanonicalBankTransferReference(bill);
         bill.setIssueDate(LocalDate.now());
 
         Long linkedSessionId = resolvePreviewSessionId(open, req, companyId);
@@ -2733,7 +2734,7 @@ public class BillingController {
         }
         bill.setConsultant(request.consultantId() != null ? users.findByIdAndCompanyId(request.consultantId(), companyId).orElseThrow() : me);
         bill.setPaymentMethod(resolvePaymentMethod(request.paymentMethodId(), companyId));
-        bill.setBankTransferReference(request.bankTransferReference() == null ? null : request.bankTransferReference().trim());
+        applyCanonicalBankTransferReference(bill);
         bill.setIssueDate(LocalDate.now());
         bill.setPaymentStatus(resolveInitialPaymentStatus(bill.getPaymentMethod()));
         if (BillPaymentStatus.PAID.equals(bill.getPaymentStatus())) {
@@ -3341,6 +3342,13 @@ public class BillingController {
         }
     }
 
+    private String peekInvoiceNumber(Long companyId) {
+        return settings.findByCompanyIdAndKey(companyId, SettingKey.INVOICE_COUNTER)
+                .map(setting -> setting.getValue() == null ? "" : setting.getValue().trim())
+                .filter(value -> !value.isBlank())
+                .orElseThrow(() -> new IllegalStateException("Missing or empty setting: INVOICE_COUNTER"));
+    }
+
     private String nextInvoiceNumber(Long companyId) {
         var setting = settings.findByCompanyIdAndKey(companyId, SettingKey.INVOICE_COUNTER)
                 .orElseThrow(() -> new IllegalStateException("Missing setting: INVOICE_COUNTER"));
@@ -3348,6 +3356,17 @@ public class BillingController {
         setting.setValue(incrementAlphaNumeric(current));
         settings.save(setting);
         return current;
+    }
+
+    private static void applyCanonicalBankTransferReference(Bill bill) {
+        if (bill == null) {
+            return;
+        }
+        if (!isBankTransferPayment(bill.getPaymentMethod())) {
+            bill.setBankTransferReference(null);
+            return;
+        }
+        bill.setBankTransferReference(UpnQrPayloadBuilder.toRfReference(bill.getBillNumber()));
     }
 
     static String incrementAlphaNumeric(String value) {
